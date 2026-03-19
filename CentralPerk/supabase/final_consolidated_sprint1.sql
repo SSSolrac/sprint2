@@ -230,6 +230,10 @@ set public = excluded.public;
 
 create index if not exists idx_members_email on public.loyalty_members(lower(email));
 create index if not exists idx_members_member_number on public.loyalty_members(member_number);
+create index if not exists idx_loyalty_members_effective_segment
+on public.loyalty_members(effective_segment);
+create index if not exists idx_loyalty_members_last_activity
+on public.loyalty_members(last_activity_at desc);
 create unique index if not exists idx_loyalty_members_phone_unique
 on public.loyalty_members (phone)
 where phone is not null and length(trim(phone)) > 0;

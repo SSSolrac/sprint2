@@ -16,7 +16,6 @@ import { Input } from "../../components/ui/input";
 import { Label } from "../../components/ui/label";
 import {
   buildSegmentStats,
-  deriveAutoSegment,
   exportMembersCsv,
   saveManualSegment,
   type MemberSegment,
@@ -94,7 +93,7 @@ export default function AdminMembersPage() {
       return {
         ...member,
         autoSegment: auto,
-        segment: manual || auto,
+        segment: effective,
         isManual: Boolean(manual),
       };
     });
@@ -194,6 +193,9 @@ export default function AdminMembersPage() {
             <p><span className="font-semibold">Email:</span> {selectedMember.email || "-"}</p>
             <p><span className="font-semibold">Points:</span> {(selectedMember.points_balance || 0).toLocaleString()}</p>
             <p><span className="font-semibold">Tier:</span> {selectedMember.tier || "Bronze"}</p>
+            <p><span className="font-semibold">Last Activity:</span> {selectedMember.last_activity_at ? new Date(selectedMember.last_activity_at).toLocaleString() : "-"}</p>
+            <p><span className="font-semibold">Auto Segment:</span> {selectedMember.auto_segment || "-"}</p>
+            <p><span className="font-semibold">Effective Segment:</span> {selectedMember.effective_segment || "-"}</p>
           </div>
         </div>
       ) : null}
