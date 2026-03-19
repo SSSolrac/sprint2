@@ -24,7 +24,7 @@ import {
 const baseSegments: Array<MemberSegment | "Manual"> = ["High Value", "Active", "At Risk", "Inactive", "Manual"];
 
 export default function AdminMembersPage() {
-  const { members, loading, error, refetch } = useAdminData();
+  const { members, transactions, loading, error, refetch } = useAdminData();
   const [query, setQuery] = useState("");
   const [awardingMember, setAwardingMember] = useState<string | null>(null);
   const [selectedMember, setSelectedMember] = useState<(typeof members)[number] | null>(null);
@@ -74,11 +74,22 @@ export default function AdminMembersPage() {
   };
 
   const segmentedMembers = useMemo(() => {
+    const latestTxByMember = new Map<string, string>();
+    for (const tx of transactions) {
+      const key = String(tx.member_id || "");
+      const at = String(tx.transaction_date || "");
+      if (!key || !at) continue;
+      const existing = latestTxByMember.get(key);
+      if (!existing || new Date(at).getTime() > new Date(existing).getTime()) {
+        latestTxByMember.set(key, at);
+      }
+    }
+
     const byMember = members.map((member) => {
       const key = String(member.member_id || member.id || member.member_number);
       const manual = manualSegmentDraft[key] || member.manual_segment || "";
-      const auto = member.auto_segment || "Inactive";
-      const effective = member.effective_segment || manual || auto;
+      const lastActivity = latestTxByMember.get(String(member.id || member.member_id || ""));
+      const auto = deriveAutoSegment(member, lastActivity);
       return {
         ...member,
         autoSegment: auto,
@@ -88,7 +99,7 @@ export default function AdminMembersPage() {
     });
 
     return byMember;
-  }, [members, manualSegmentDraft]);
+  }, [members, transactions, manualSegmentDraft]);
 
   const filtered = useMemo(() => {
     const q = query.trim().toLowerCase();
@@ -109,9 +120,9 @@ export default function AdminMembersPage() {
   const handleManualSegmentSave = async (memberNumber: string, memberId: string, value: string) => {
     try {
       const saved = await saveManualSegment(memberNumber, value);
-      setManualSegmentDraft((prev) => ({ ...prev, [memberId]: saved || "" }));
+      setManualSegmentDraft((prev) => ({ ...prev, [memberId]: saved }));
       await refetch();
-      toast.success(saved ? "Manual segment saved." : "Manual segment cleared.");
+      toast.success("Manual segment saved.");
     } catch (error) {
       toast.error(error instanceof Error ? error.message : "Unable to save manual segment.");
     }
@@ -253,7 +264,7 @@ export default function AdminMembersPage() {
                         <Input
                           value={manualSegmentDraft[key] || member.manual_segment || ""}
                           onChange={(e) => setManualSegmentDraft((prev) => ({ ...prev, [key]: e.target.value }))}
-                          placeholder="High Value | Active | At Risk | Inactive (blank = auto)"
+                          placeholder="High Value | Active | At Risk | Inactive"
                           className="h-8 text-xs"
                         />
                         <Button

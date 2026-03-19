@@ -29,10 +29,6 @@ create table if not exists public.loyalty_members (
 
 alter table public.loyalty_members
   add column if not exists manual_segment text,
-  add column if not exists auto_segment text,
-  add column if not exists effective_segment text,
-  add column if not exists last_activity_at timestamptz,
-  add column if not exists segment_updated_at timestamptz,
   add column if not exists sms_enabled boolean not null default true,
   add column if not exists email_enabled boolean not null default true,
   add column if not exists push_enabled boolean not null default true,
@@ -50,28 +46,6 @@ begin
     alter table public.loyalty_members
       add constraint loyalty_members_manual_segment_check
       check (manual_segment is null or manual_segment in ('High Value', 'Active', 'At Risk', 'Inactive'));
-  end if;
-
-  if not exists (
-    select 1
-    from pg_constraint
-    where conname = 'loyalty_members_auto_segment_check'
-      and conrelid = 'public.loyalty_members'::regclass
-  ) then
-    alter table public.loyalty_members
-      add constraint loyalty_members_auto_segment_check
-      check (auto_segment is null or auto_segment in ('High Value', 'Active', 'At Risk', 'Inactive'));
-  end if;
-
-  if not exists (
-    select 1
-    from pg_constraint
-    where conname = 'loyalty_members_effective_segment_check'
-      and conrelid = 'public.loyalty_members'::regclass
-  ) then
-    alter table public.loyalty_members
-      add constraint loyalty_members_effective_segment_check
-      check (effective_segment is null or effective_segment in ('High Value', 'Active', 'At Risk', 'Inactive'));
   end if;
 
   if not exists (
@@ -582,176 +556,6 @@ begin
 end;
 $$;
 
-create or replace function public.loyalty_compute_auto_segment(
-  p_points_balance int,
-  p_tier text,
-  p_last_activity_at timestamptz,
-  p_enrollment_date date,
-  p_created_at timestamptz
-)
-returns text
-language plpgsql
-stable
-as $$
-declare
-  v_days_since_activity int;
-  v_activity timestamptz;
-begin
-  v_activity := coalesce(
-    p_last_activity_at,
-    p_enrollment_date::timestamptz,
-    p_created_at
-  );
-  v_days_since_activity := greatest(0, (current_date - coalesce(v_activity::date, current_date)));
-
-  if coalesce(p_points_balance, 0) >= 2500 or (lower(coalesce(p_tier, 'bronze')) = 'gold' and coalesce(p_points_balance, 0) >= 1200) then
-    return 'High Value';
-  end if;
-
-  if v_days_since_activity <= 30 then
-    return 'Active';
-  end if;
-
-  if v_days_since_activity <= 90 then
-    return 'At Risk';
-  end if;
-
-  return 'Inactive';
-end;
-$$;
-
-create or replace function public.loyalty_refresh_member_segmentation(p_member_id bigint)
-returns void
-language plpgsql
-security definer
-set search_path = public
-as $$
-declare
-  v_last_tx timestamptz;
-  v_last_login timestamptz;
-  v_current record;
-  v_last_activity timestamptz;
-  v_auto_segment text;
-begin
-  select *
-  into v_current
-  from public.loyalty_members
-  where id = p_member_id
-  limit 1;
-
-  if v_current is null then
-    return;
-  end if;
-
-  select max(transaction_date)
-  into v_last_tx
-  from public.loyalty_transactions
-  where member_id = p_member_id;
-
-  select max(login_at)
-  into v_last_login
-  from public.member_login_activity
-  where member_id = p_member_id;
-
-  v_last_activity := greatest(
-    coalesce(v_last_tx, '-infinity'::timestamptz),
-    coalesce(v_last_login, '-infinity'::timestamptz),
-    coalesce(v_current.enrollment_date::timestamptz, '-infinity'::timestamptz),
-    coalesce(v_current.created_at, '-infinity'::timestamptz)
-  );
-
-  if v_last_activity = '-infinity'::timestamptz then
-    v_last_activity := now();
-  end if;
-
-  v_auto_segment := public.loyalty_compute_auto_segment(
-    v_current.points_balance,
-    v_current.tier,
-    v_last_activity,
-    v_current.enrollment_date,
-    v_current.created_at
-  );
-
-  update public.loyalty_members
-  set
-    last_activity_at = v_last_activity,
-    auto_segment = v_auto_segment,
-    effective_segment = coalesce(v_current.manual_segment, v_auto_segment),
-    segment_updated_at = now()
-  where id = p_member_id;
-end;
-$$;
-
-create or replace function public.loyalty_refresh_member_segmentation_on_member_change()
-returns trigger
-language plpgsql
-security definer
-set search_path = public
-as $$
-begin
-  if pg_trigger_depth() > 1 then
-    return new;
-  end if;
-  perform public.loyalty_refresh_member_segmentation(new.id);
-  return new;
-end;
-$$;
-
-drop trigger if exists trg_refresh_member_segmentation_on_member_change on public.loyalty_members;
-create trigger trg_refresh_member_segmentation_on_member_change
-after insert or update of points_balance, tier, manual_segment, enrollment_date, created_at
-on public.loyalty_members
-for each row
-execute function public.loyalty_refresh_member_segmentation_on_member_change();
-
-create or replace function public.loyalty_refresh_member_segmentation_on_transaction()
-returns trigger
-language plpgsql
-security definer
-set search_path = public
-as $$
-begin
-  perform public.loyalty_refresh_member_segmentation(new.member_id);
-  if tg_op = 'UPDATE' and old.member_id is distinct from new.member_id then
-    perform public.loyalty_refresh_member_segmentation(old.member_id);
-  end if;
-  return new;
-end;
-$$;
-
-drop trigger if exists trg_refresh_member_segmentation_on_transaction on public.loyalty_transactions;
-create trigger trg_refresh_member_segmentation_on_transaction
-after insert or update of member_id, transaction_date, points on public.loyalty_transactions
-for each row
-execute function public.loyalty_refresh_member_segmentation_on_transaction();
-
-create or replace function public.loyalty_refresh_member_segmentation_on_login()
-returns trigger
-language plpgsql
-security definer
-set search_path = public
-as $$
-begin
-  perform public.loyalty_refresh_member_segmentation(new.member_id);
-  return new;
-end;
-$$;
-
-drop trigger if exists trg_refresh_member_segmentation_on_login on public.member_login_activity;
-create trigger trg_refresh_member_segmentation_on_login
-after insert on public.member_login_activity
-for each row
-execute function public.loyalty_refresh_member_segmentation_on_login();
-
-do $$
-declare
-  m record;
-begin
-  for m in select id from public.loyalty_members loop
-    perform public.loyalty_refresh_member_segmentation(m.id);
-  end loop;
-end $$;
-
 create or replace function public.loyalty_member_segments()
 returns table (
   member_id bigint,
@@ -764,22 +568,35 @@ returns table (
 language sql
 stable
 as $$
+  with latest_activity as (
+    select
+      t.member_id,
+      max(t.transaction_date) as last_activity_at
+    from public.loyalty_transactions t
+    group by t.member_id
+  )
   select
     m.id as member_id,
     m.member_number::text as member_number,
-    coalesce(
-      m.auto_segment,
-      public.loyalty_compute_auto_segment(m.points_balance, m.tier, m.last_activity_at, m.enrollment_date, m.created_at)
-    ) as auto_segment,
+    case
+      when m.points_balance >= 2500 or (lower(coalesce(m.tier, 'bronze')) = 'gold' and m.points_balance >= 1200) then 'High Value'
+      when coalesce((current_date - coalesce(la.last_activity_at::date, m.enrollment_date)), 99999) <= 30 then 'Active'
+      when coalesce((current_date - coalesce(la.last_activity_at::date, m.enrollment_date)), 99999) <= 90 then 'At Risk'
+      else 'Inactive'
+    end as auto_segment,
     m.manual_segment,
     coalesce(
-      m.effective_segment,
       m.manual_segment,
-      m.auto_segment,
-      public.loyalty_compute_auto_segment(m.points_balance, m.tier, m.last_activity_at, m.enrollment_date, m.created_at)
+      case
+        when m.points_balance >= 2500 or (lower(coalesce(m.tier, 'bronze')) = 'gold' and m.points_balance >= 1200) then 'High Value'
+        when coalesce((current_date - coalesce(la.last_activity_at::date, m.enrollment_date)), 99999) <= 30 then 'Active'
+        when coalesce((current_date - coalesce(la.last_activity_at::date, m.enrollment_date)), 99999) <= 90 then 'At Risk'
+        else 'Inactive'
+      end
     ) as effective_segment,
-    coalesce(m.last_activity_at, m.enrollment_date::timestamptz, m.created_at) as last_activity_at
-  from public.loyalty_members m;
+    la.last_activity_at
+  from public.loyalty_members m
+  left join latest_activity la on la.member_id = m.id;
 $$;
 
 -- ============================================================
