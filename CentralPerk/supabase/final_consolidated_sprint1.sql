@@ -27,6 +27,65 @@ create table if not exists public.loyalty_members (
   profile_photo_url text
 );
 
+alter table public.loyalty_members
+  add column if not exists manual_segment text,
+  add column if not exists auto_segment text,
+  add column if not exists effective_segment text,
+  add column if not exists last_activity_at timestamptz,
+  add column if not exists segment_updated_at timestamptz,
+  add column if not exists sms_enabled boolean not null default true,
+  add column if not exists email_enabled boolean not null default true,
+  add column if not exists push_enabled boolean not null default true,
+  add column if not exists promotional_opt_in boolean not null default true,
+  add column if not exists communication_frequency text not null default 'weekly';
+
+do $$
+begin
+  if not exists (
+    select 1
+    from pg_constraint
+    where conname = 'loyalty_members_manual_segment_check'
+      and conrelid = 'public.loyalty_members'::regclass
+  ) then
+    alter table public.loyalty_members
+      add constraint loyalty_members_manual_segment_check
+      check (manual_segment is null or manual_segment in ('High Value', 'Active', 'At Risk', 'Inactive'));
+  end if;
+
+  if not exists (
+    select 1
+    from pg_constraint
+    where conname = 'loyalty_members_auto_segment_check'
+      and conrelid = 'public.loyalty_members'::regclass
+  ) then
+    alter table public.loyalty_members
+      add constraint loyalty_members_auto_segment_check
+      check (auto_segment is null or auto_segment in ('High Value', 'Active', 'At Risk', 'Inactive'));
+  end if;
+
+  if not exists (
+    select 1
+    from pg_constraint
+    where conname = 'loyalty_members_effective_segment_check'
+      and conrelid = 'public.loyalty_members'::regclass
+  ) then
+    alter table public.loyalty_members
+      add constraint loyalty_members_effective_segment_check
+      check (effective_segment is null or effective_segment in ('High Value', 'Active', 'At Risk', 'Inactive'));
+  end if;
+
+  if not exists (
+    select 1
+    from pg_constraint
+    where conname = 'loyalty_members_communication_frequency_check'
+      and conrelid = 'public.loyalty_members'::regclass
+  ) then
+    alter table public.loyalty_members
+      add constraint loyalty_members_communication_frequency_check
+      check (communication_frequency in ('daily', 'weekly', 'never'));
+  end if;
+end $$;
+
 create table if not exists public.app_user_roles (
   user_id uuid primary key references auth.users(id) on delete cascade,
   role text check (role in ('admin', 'customer')),
@@ -78,6 +137,9 @@ create table if not exists public.notification_outbox (
   created_at timestamptz default now(),
   sent_at timestamptz
 );
+
+alter table public.notification_outbox
+  add column if not exists is_promotional boolean not null default false;
 
 create table if not exists public.loyalty_member_profile_audit (
   id bigserial primary key,
@@ -194,6 +256,10 @@ set public = excluded.public;
 
 create index if not exists idx_members_email on public.loyalty_members(lower(email));
 create index if not exists idx_members_member_number on public.loyalty_members(member_number);
+create index if not exists idx_loyalty_members_effective_segment
+on public.loyalty_members(effective_segment);
+create index if not exists idx_loyalty_members_last_activity
+on public.loyalty_members(last_activity_at desc);
 create unique index if not exists idx_loyalty_members_phone_unique
 on public.loyalty_members (phone)
 where phone is not null and length(trim(phone)) > 0;
@@ -516,9 +582,264 @@ begin
 end;
 $$;
 
+create or replace function public.loyalty_compute_auto_segment(
+  p_points_balance int,
+  p_tier text,
+  p_last_activity_at timestamptz,
+  p_enrollment_date date,
+  p_created_at timestamptz
+)
+returns text
+language plpgsql
+stable
+as $$
+declare
+  v_days_since_activity int;
+  v_activity timestamptz;
+begin
+  v_activity := coalesce(
+    p_last_activity_at,
+    p_enrollment_date::timestamptz,
+    p_created_at
+  );
+  v_days_since_activity := greatest(0, (current_date - coalesce(v_activity::date, current_date)));
+
+  if coalesce(p_points_balance, 0) >= 2500 or (lower(coalesce(p_tier, 'bronze')) = 'gold' and coalesce(p_points_balance, 0) >= 1200) then
+    return 'High Value';
+  end if;
+
+  if v_days_since_activity <= 30 then
+    return 'Active';
+  end if;
+
+  if v_days_since_activity <= 90 then
+    return 'At Risk';
+  end if;
+
+  return 'Inactive';
+end;
+$$;
+
+create or replace function public.loyalty_refresh_member_segmentation(p_member_id bigint)
+returns void
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  v_last_tx timestamptz;
+  v_last_login timestamptz;
+  v_current record;
+  v_last_activity timestamptz;
+  v_auto_segment text;
+begin
+  select *
+  into v_current
+  from public.loyalty_members
+  where id = p_member_id
+  limit 1;
+
+  if v_current is null then
+    return;
+  end if;
+
+  select max(transaction_date)
+  into v_last_tx
+  from public.loyalty_transactions
+  where member_id = p_member_id;
+
+  select max(login_at)
+  into v_last_login
+  from public.member_login_activity
+  where member_id = p_member_id;
+
+  v_last_activity := greatest(
+    coalesce(v_last_tx, '-infinity'::timestamptz),
+    coalesce(v_last_login, '-infinity'::timestamptz),
+    coalesce(v_current.enrollment_date::timestamptz, '-infinity'::timestamptz),
+    coalesce(v_current.created_at, '-infinity'::timestamptz)
+  );
+
+  if v_last_activity = '-infinity'::timestamptz then
+    v_last_activity := now();
+  end if;
+
+  v_auto_segment := public.loyalty_compute_auto_segment(
+    v_current.points_balance,
+    v_current.tier,
+    v_last_activity,
+    v_current.enrollment_date,
+    v_current.created_at
+  );
+
+  update public.loyalty_members
+  set
+    last_activity_at = v_last_activity,
+    auto_segment = v_auto_segment,
+    effective_segment = coalesce(v_current.manual_segment, v_auto_segment),
+    segment_updated_at = now()
+  where id = p_member_id;
+end;
+$$;
+
+create or replace function public.loyalty_refresh_member_segmentation_on_member_change()
+returns trigger
+language plpgsql
+security definer
+set search_path = public
+as $$
+begin
+  if pg_trigger_depth() > 1 then
+    return new;
+  end if;
+  perform public.loyalty_refresh_member_segmentation(new.id);
+  return new;
+end;
+$$;
+
+drop trigger if exists trg_refresh_member_segmentation_on_member_change on public.loyalty_members;
+create trigger trg_refresh_member_segmentation_on_member_change
+after insert or update of points_balance, tier, manual_segment, enrollment_date, created_at
+on public.loyalty_members
+for each row
+execute function public.loyalty_refresh_member_segmentation_on_member_change();
+
+create or replace function public.loyalty_refresh_member_segmentation_on_transaction()
+returns trigger
+language plpgsql
+security definer
+set search_path = public
+as $$
+begin
+  perform public.loyalty_refresh_member_segmentation(new.member_id);
+  if tg_op = 'UPDATE' and old.member_id is distinct from new.member_id then
+    perform public.loyalty_refresh_member_segmentation(old.member_id);
+  end if;
+  return new;
+end;
+$$;
+
+drop trigger if exists trg_refresh_member_segmentation_on_transaction on public.loyalty_transactions;
+create trigger trg_refresh_member_segmentation_on_transaction
+after insert or update of member_id, transaction_date, points on public.loyalty_transactions
+for each row
+execute function public.loyalty_refresh_member_segmentation_on_transaction();
+
+create or replace function public.loyalty_refresh_member_segmentation_on_login()
+returns trigger
+language plpgsql
+security definer
+set search_path = public
+as $$
+begin
+  perform public.loyalty_refresh_member_segmentation(new.member_id);
+  return new;
+end;
+$$;
+
+drop trigger if exists trg_refresh_member_segmentation_on_login on public.member_login_activity;
+create trigger trg_refresh_member_segmentation_on_login
+after insert on public.member_login_activity
+for each row
+execute function public.loyalty_refresh_member_segmentation_on_login();
+
+do $$
+declare
+  m record;
+begin
+  for m in select id from public.loyalty_members loop
+    perform public.loyalty_refresh_member_segmentation(m.id);
+  end loop;
+end $$;
+
+create or replace function public.loyalty_member_segments()
+returns table (
+  member_id bigint,
+  member_number text,
+  auto_segment text,
+  manual_segment text,
+  effective_segment text,
+  last_activity_at timestamptz
+)
+language sql
+stable
+as $$
+  select
+    m.id as member_id,
+    m.member_number::text as member_number,
+    coalesce(
+      m.auto_segment,
+      public.loyalty_compute_auto_segment(m.points_balance, m.tier, m.last_activity_at, m.enrollment_date, m.created_at)
+    ) as auto_segment,
+    m.manual_segment,
+    coalesce(
+      m.effective_segment,
+      m.manual_segment,
+      m.auto_segment,
+      public.loyalty_compute_auto_segment(m.points_balance, m.tier, m.last_activity_at, m.enrollment_date, m.created_at)
+    ) as effective_segment,
+    coalesce(m.last_activity_at, m.enrollment_date::timestamptz, m.created_at) as last_activity_at
+  from public.loyalty_members m;
+$$;
+
 -- ============================================================
 -- NOTIFICATION TRIGGERS
 -- ============================================================
+
+create or replace function public.loyalty_enforce_notification_preferences()
+returns trigger
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  pref record;
+begin
+  if new.user_id is null then
+    return new;
+  end if;
+
+  select
+    m.sms_enabled,
+    m.email_enabled,
+    m.push_enabled,
+    m.promotional_opt_in,
+    m.communication_frequency
+  into pref
+  from auth.users u
+  join public.loyalty_members m on lower(m.email) = lower(u.email)
+  where u.id = new.user_id
+  limit 1;
+
+  if pref is null then
+    return new;
+  end if;
+
+  if new.channel = 'sms' and coalesce(pref.sms_enabled, true) = false then
+    return null;
+  end if;
+
+  if new.channel = 'email' and coalesce(pref.email_enabled, true) = false then
+    return null;
+  end if;
+
+  if new.channel = 'push' and coalesce(pref.push_enabled, true) = false then
+    return null;
+  end if;
+
+  if coalesce(new.is_promotional, false) = true and coalesce(pref.promotional_opt_in, true) = false then
+    return null;
+  end if;
+
+  return new;
+end;
+$$;
+
+drop trigger if exists trg_enforce_notification_preferences on public.notification_outbox;
+create trigger trg_enforce_notification_preferences
+before insert on public.notification_outbox
+for each row
+execute function public.loyalty_enforce_notification_preferences();
 
 create or replace function public.loyalty_queue_welcome_notifications()
 returns trigger
