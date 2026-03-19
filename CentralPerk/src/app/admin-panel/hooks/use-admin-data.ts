@@ -83,6 +83,21 @@ function isMissingRelationError(error: unknown, table: string) {
   );
 }
 
+function isMissingFunctionError(error: unknown, fnName: string) {
+  const message = String(
+    (error as { message?: unknown; details?: unknown; hint?: unknown })?.message ??
+      (error as { details?: unknown })?.details ??
+      (error as { hint?: unknown })?.hint ??
+      ""
+  ).toLowerCase();
+
+  return (
+    message.includes(`function ${fnName.toLowerCase()}`) ||
+    message.includes(`could not find the function public.${fnName.toLowerCase()}`) ||
+    (message.includes(fnName.toLowerCase()) && message.includes("does not exist"))
+  );
+}
+
 export function useAdminData() {
   const [members, setMembers] = useState<Member[]>([]);
   const [redemptions, setRedemptions] = useState<LoyaltyTransaction[]>([]);
@@ -111,6 +126,7 @@ export function useAdminData() {
 
       const [
         membersRes,
+        memberSegmentsRes,
         redemptionsRes,
         transactionsRes,
         tierHistoryRes,
@@ -123,6 +139,7 @@ export function useAdminData() {
         redemptionSettingsRes,
       ] = await Promise.all([
         supabase.from("loyalty_members").select("*").order("enrollment_date", { ascending: false }),
+        supabase.rpc("loyalty_member_segments"),
         supabase.from("loyalty_transactions").select("*").eq("transaction_type", "REDEEM"),
         supabase
           .from("loyalty_transactions")
@@ -145,6 +162,9 @@ export function useAdminData() {
       ]);
 
       if (membersRes.error) throw membersRes.error;
+      if (memberSegmentsRes.error && !isMissingFunctionError(memberSegmentsRes.error, "loyalty_member_segments")) {
+        throw memberSegmentsRes.error;
+      }
       if (transactionsRes.error) throw transactionsRes.error;
       if (pointsLotsRes.error && !isMissingRelationError(pointsLotsRes.error, "points_lots")) throw pointsLotsRes.error;
       if (rewardsCatalogRes.error && !isMissingRelationError(rewardsCatalogRes.error, "rewards_catalog")) throw rewardsCatalogRes.error;
@@ -153,7 +173,43 @@ export function useAdminData() {
         throw reengagementActionsRes.error;
       }
 
-      setMembers((membersRes.data || []) as Member[]);
+      const baseMembers = (membersRes.data || []) as Member[];
+      const segmentRows = (memberSegmentsRes.error ? [] : memberSegmentsRes.data || []) as Array<{
+        member_id?: number | string | null;
+        member_number?: string | null;
+        auto_segment?: Member["auto_segment"];
+        manual_segment?: Member["manual_segment"];
+        effective_segment?: Member["effective_segment"];
+        last_activity_at?: string | null;
+      }>;
+      const segmentByMemberPk = new Map<string, (typeof segmentRows)[number]>();
+      const segmentByMemberNumber = new Map<string, (typeof segmentRows)[number]>();
+
+      for (const row of segmentRows) {
+        if (row.member_id !== undefined && row.member_id !== null) {
+          segmentByMemberPk.set(String(row.member_id), row);
+        }
+        if (row.member_number) {
+          segmentByMemberNumber.set(String(row.member_number), row);
+        }
+      }
+
+      const membersWithSegments = baseMembers.map((member) => {
+        const segmentRow =
+          segmentByMemberPk.get(String(member.id ?? member.member_id ?? "")) ||
+          segmentByMemberNumber.get(String(member.member_number || ""));
+        if (!segmentRow) return member;
+
+        return {
+          ...member,
+          auto_segment: segmentRow.auto_segment ?? member.auto_segment ?? null,
+          manual_segment: segmentRow.manual_segment ?? member.manual_segment ?? null,
+          effective_segment: segmentRow.effective_segment ?? member.effective_segment ?? null,
+          last_activity_at: segmentRow.last_activity_at ?? member.last_activity_at ?? null,
+        } satisfies Member;
+      });
+
+      setMembers(membersWithSegments);
       setRedemptions(redemptionsRes.error ? [] : ((redemptionsRes.data || []) as LoyaltyTransaction[]));
       setTransactions((transactionsRes.data || []) as LoyaltyTransaction[]);
       setTierHistory((tierHistoryRes.error ? [] : tierHistoryRes.data || []) as TierHistoryRow[]);
