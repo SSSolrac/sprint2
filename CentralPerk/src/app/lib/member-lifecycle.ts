@@ -95,9 +95,8 @@ function normalizeManualSegment(value: string): MemberSegment | null {
 }
 
 export async function saveManualSegment(memberNumber: string, segmentName: string) {
-  const trimmed = segmentName.trim();
-  const normalized = trimmed ? normalizeManualSegment(trimmed) : null;
-  if (trimmed && !normalized) throw new Error("Manual segment must be one of: High Value, Active, At Risk, Inactive.");
+  const normalized = normalizeManualSegment(segmentName);
+  if (!normalized) throw new Error("Manual segment must be one of: High Value, Active, At Risk, Inactive.");
 
   const result = await supabase
     .from("loyalty_members")
